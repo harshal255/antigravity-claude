@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4-Stroke Piston Engine | Cross-Section Animation</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #08080e; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="engine"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('engine');
+  const ctx = canvas.getContext('2d');
+  let W, H;
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ═══════════════════════════════════════
+     ENGINE GEOMETRY CONSTANTS
+     ═══════════════════════════════════════ */
+  const R    = 58;   // crank radius
+  const L    = 138;  // connecting rod length
+  const BORE = 104;  // cylinder bore width
+  const PH   = 42;   // piston height
+  const WT   = 16;   // cylinder wall thickness
+  const CLR  = 14;   // combustion chamber clearance at TDC
+  const HH   = 44;   // cylinder head height
+  const MAX_VALVE_LIFT = 13;
+
+  /* ═══════════════════════════════════════
+     ANIMATION STATE
+     ═══════════════════════════════════════ */
+  let crankAngle = 0;
+  const SPEED = 0.032;
+  let particles = [];
+  let sparkTimer = 0;
+
+  /* ═══════════════════════════════════════
+     KINEMATICS
+     ═══════════════════════════════════════ */
+  function getCycleAngle() {
+    return ((crankAngle % (4 * Math.PI)) + 4 * Math.PI) % (4 * Math.PI);
+  }
+
+  function getStroke() {
+    const ca = getCycleAngle();
+    if (ca < Math.PI)       return { name: 'INTAKE',      desc: 'Air-fuel mixture drawn in',  phase: 0, progress: ca / Math.PI };
+    if (ca < 2 * Math.PI)   return { name: 'COMPRESSION', desc: 'Mixture compressed',         phase: 1, progress: (ca - Math.PI) / Math.PI };
+    if (ca < 3 * Math.PI)   return { name: 'POWER',       desc: 'Combustion drives piston',   phase: 2, progress: (ca - 2*Math.PI) / Math.PI };
+    return                          { name: 'EXHAUST',     desc: 'Burnt gases expelled',       phase: 3, progress: (ca - 3*Math.PI) / Math.PI };
+  }
+
+  function getPistonPinY(cy) {
+    const s = Math.sin(crankAngle), c = Math.cos(crankAngle);
+    return cy - R * c - Math.sqrt(L*L - R*R*s*s);
+  }
+
+  function getCrankPin(cx, cy) {
+    return { x: cx + R * Math.sin(crankAngle), y: cy - R * Math.cos(crankAngle) };
+  }
+
+  function getValveLift(progress) {
+    const ramp = 5;
+    const openAmt = Math.min(1, progress * ramp);
+    const closeAmt = Math.min(1, (1 - progress) * ramp);
+    return Math.min(openAmt, closeAmt) * MAX_VALVE_LIFT;
+  }
+
+  /* ═══════════════════════════════════════
+     COLOR HELPERS
+     ═══════════════════════════════════════ */
+  function lerpColor(a, b, t) {
+    return a.map((v, i) => Math.round(v + (b[i] - v) * t));
+  }
+
+  function rgba(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+
+  const COL_BLUE   = [40, 140, 240];
+  const COL_ORANGE = [255, 150, 30];
+  const COL_GRAY   = [140, 140, 140];
+
+  function getGasColor(stroke) {
+    const t = Math.min(1, stroke.progress * 8);
+    switch (stroke.phase) {
+      case 0: return lerpColor(COL_GRAY, COL_BLUE, t);
+      case 1: return COL_BLUE;
+      case 2: return lerpColor(COL_BLUE, COL_ORANGE, t);
+      case 3: return lerpColor(COL_ORANGE, COL_GRAY, t);
+    }
+  }
+
+  /* ═══════════════════════════════════════
+     PARTICLE SYSTEM
+     ═══════════════════════════════════════ */
+  function spawnParticle(x, y, vx, vy, color, life, size) {
+    if (particles.length > 300) return;
+    particles.push({ x, y, vx, vy, color, life, maxLife: life, size });
+  }
+
+  function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vx *= 0.97;
+      p.vy *= 0.97;
+      p.life--;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      const alpha = (p.life / p.maxLife) * 0.65;
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * (0.4 + 0.6 * p.life / p.maxLife), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ═══════════════════════════════════════
+     METALLIC GRADIENT HELPERS
+     ═══════════════════════════════════════ */
+  function metalGradH(x, w) {
+    const g = ctx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0,    '#4a4a52');
+    g.addColorStop(0.15, '#78787f');
+    g.addColorStop(0.4,  '#5e5e66');
+    g.addColorStop(0.55, '#9a9aa2');
+    g.addColorStop(0.8,  '#6a6a72');
+    g.addColorStop(1,    '#3e3e46');
+    return g;
+  }
+
+  function metalGradV(y, h) {
+    const g = ctx.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0,    '#5a5a62');
+    g.addColorStop(0.2,  '#88888f');
+    g.addColorStop(0.5,  '#6e6e76');
+    g.addColorStop(0.8,  '#9e9ea6');
+    g.addColorStop(1,    '#4a4a52');
+    return g;
+  }
+
+  function darkMetalGradH(x, w) {
+    const g = ctx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0,    '#2a2a30');
+    g.addColorStop(0.3,  '#48484f');
+    g.addColorStop(0.6,  '#3a3a42');
+    g.addColorStop(1,    '#222228');
+    return g;
+  }
+
+  /* ═══════════════════════════════════════
+     DRAWING FUNCTIONS
+     ═══════════════════════════════════════ */
+
+  function drawBackground() {
+    const g = ctx.createRadialGradient(W * 0.4, H * 0.45, 0, W * 0.4, H * 0.45, W * 0.85);
+    g.addColorStop(0, '#14141e');
+    g.addColorStop(1, '#08080e');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.018)';
+    ctx.lineWidth = 0.5;
+    const step = 32;
+    for (let x = 0; x < W; x += step) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+    for (let y = 0; y < H; y += step) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  }
+
+  function drawCrankcase(cx, cy, chamberCeil) {
+    const caseL = cx - BORE / 2 - WT - 6;
+    const caseR = cx + BORE / 2 + WT + 6;
+    const caseT = chamberCeil;
+    const caseB = cy + R + 50;
+    const caseW = caseR - caseL;
+    const caseH = caseB - caseT;
+
+    ctx.fillStyle = darkMetalGradH(caseL, caseW);
+    ctx.beginPath();
+    ctx.moveTo(caseL, caseT);
+    ctx.lineTo(caseR, caseT);
+    ctx.lineTo(caseR, cy - 10);
+    ctx.lineTo(caseR + 18, cy + 10);
+    ctx.lineTo(caseR + 18, caseB);
+    ctx.quadraticCurveTo(caseR + 18, caseB + 14, caseR + 4, caseB + 14);
+    ctx.lineTo(caseL - 4, caseB + 14);
+    ctx.quadraticCurveTo(caseL - 18, caseB + 14, caseL - 18, caseB);
+    ctx.lineTo(caseL - 18, cy + 10);
+    ctx.lineTo(caseL, cy - 10);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  function drawCrankshaft(cx, cy, cp) {
+    // Counterweight (opposite side)
+    const cwX = cx - R * 1.35 * Math.sin(crankAngle);
+    const cwY = cy + R * 1.35 * Math.cos(crankAngle);
+    const cwAngle = crankAngle + Math.PI;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(crankAngle);
+    // Counterweight shape
+    ctx.beginPath();
+    ctx.moveTo(-14, 0);
+    ctx.lineTo(-22, R * 0.5);
+    ctx.quadraticCurveTo(-30, R * 1.1, -18, R * 1.35);
+    ctx.arc(0, 0, R * 1.35, Math.PI + Math.atan2(18, R*1.35), Math.PI - Math.atan2(18, R*1.35), true);
+    ctx.quadraticCurveTo(30, R * 1.1, 22, R * 0.5);
+    ctx.lineTo(14, 0);
+    ctx.closePath();
+    const cwGrad = ctx.createLinearGradient(-30, 0, 30, 0);
+    cwGrad.addColorStop(0, '#3a3a42');
+    cwGrad.addColorStop(0.5, '#58585f');
+    cwGrad.addColorStop(1, '#2e2e36');
+    ctx.fillStyle = cwGrad;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Crank arm toward pin
+    ctx.beginPath();
+    ctx.moveTo(-11, 0);
+    ctx.lineTo(-9, -R + 6);
+    ctx.lineTo(9, -R + 6);
+    ctx.lineTo(11, 0);
+    ctx.closePath();
+    const armGrad = ctx.createLinearGradient(-12, 0, 12, 0);
+    armGrad.addColorStop(0, '#44444c');
+    armGrad.addColorStop(0.4, '#6e6e76');
+    armGrad.addColorStop(1, '#3a3a42');
+    ctx.fillStyle = armGrad;
+    ctx.fill();
+    ctx.stroke();
+
+    // Crank pin
+    ctx.beginPath();
+    ctx.arc(0, -R, 10, 0, Math.PI * 2);
+    const pinGrad = ctx.createRadialGradient(-2, -R - 2, 1, 0, -R, 10);
+    pinGrad.addColorStop(0, '#a8a8b0');
+    pinGrad.addColorStop(1, '#48484f');
+    ctx.fillStyle = pinGrad;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.stroke();
+    ctx.restore();
+
+    // Main journal
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+    const jGrad = ctx.createRadialGradient(cx - 4, cy - 4, 2, cx, cy, 18);
+    jGrad.addColorStop(0, '#b0b0b8');
+    jGrad.addColorStop(0.6, '#6e6e76');
+    jGrad.addColorStop(1, '#3a3a42');
+    ctx.fillStyle = jGrad;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Center dot
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#222';
+    ctx.fill();
+  }
+
+  function drawConnectingRod(cx, pinY, cp) {
+    const dx = cp.x - cx;
+    const dy = cp.y - pinY;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const angle = Math.atan2(dx, dy);
+
+    const wTop = 13;
+    const wBot = 20;
+
+    ctx.save();
+    ctx.translate(cx, pinY);
+    ctx.rotate(-angle);
+
+    // Rod body
+    ctx.beginPath();
+    ctx.moveTo(-wTop / 2, 0);
+    ctx.lineTo(-wBot / 2, len);
+    ctx.lineTo(wBot / 2, len);
+    ctx.lineTo(wTop / 2, 0);
+    ctx.closePath();
+    const rodGrad = ctx.createLinearGradient(-wBot / 2, 0, wBot / 2, 0);
+    rodGrad.addColorStop(0,   '#3e3e46');
+    rodGrad.addColorStop(0.3, '#7a7a82');
+    rodGrad.addColorStop(0.5, '#8e8e96');
+    rodGrad.addColorStop(0.7, '#7a7a82');
+    rodGrad.addColorStop(1,   '#3e3e46');
+    ctx.fillStyle = rodGrad;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // I-beam center groove
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 12);
+    ctx.lineTo(0, len - 14);
+    ctx.stroke();
+
+    ctx.restore();
+
+    // Small end bearing (at piston pin)
+    ctx.beginPath();
+    ctx.arc(cx, pinY, 7, 0, Math.PI * 2);
+    const seGrad = ctx.createRadialGradient(cx - 1, pinY - 1, 1, cx, pinY, 7);
+    seGrad.addColorStop(0, '#b0b0b8');
+    seGrad.addColorStop(1, '#58585f');
+    ctx.fillStyle = seGrad;
+    ctx.fill();
+  }
+
+  function drawCylinderWalls(cx, cy, chamberCeil) {
+    const boreL = cx - BORE / 2;
+    const boreR = cx + BORE / 2;
+    const wallTop = chamberCeil - 2;
+    const wallBot = cy + 20;
+
+    // Left wall
+    ctx.fillStyle = metalGradH(boreL - WT, WT);
+    ctx.fillRect(boreL - WT, wallTop, WT, wallBot - wallTop);
+
+    // Right wall
+    ctx.fillStyle = metalGradH(boreR, WT);
+    ctx.fillRect(boreR, wallTop, WT, wallBot - wallTop);
+
+    // Inner bore surface (darker edge lines)
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(boreL, wallTop); ctx.lineTo(boreL, wallBot); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(boreR, wallTop); ctx.lineTo(boreR, wallBot); ctx.stroke();
+
+    // Outer edge highlights
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(boreL - WT, wallTop); ctx.lineTo(boreL - WT, wallBot); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(boreR + WT, wallTop); ctx.lineTo(boreR + WT, wallBot); ctx.stroke();
+
+    // Cooling fins (3 on each side)
+    for (let i = 0; i < 3; i++) {
+      const fy = wallTop + 50 + i * 65;
+      // Left fins
+      ctx.fillStyle = '#3a3a42';
+      ctx.fillRect(boreL - WT - 12, fy, 12, 5);
+      ctx.fillRect(boreL - WT - 8, fy + 18, 8, 4);
+      // Right fins
+      ctx.fillRect(boreR + WT, fy, 12, 5);
+      ctx.fillRect(boreR + WT, fy + 18, 8, 4);
+    }
+  }
+
+  function drawGas(cx, chamberCeil, pistonTop, stroke) {
+    const gasH = pistonTop - chamberCeil;
+    if (gasH <= 2) return;
+
+    const boreL = cx - BORE / 2;
+    const col = getGasColor(stroke);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(boreL + 1, chamberCeil, BORE - 2, gasH);
+    ctx.clip();
+
+    // Base gas fill
+    const baseAlpha = stroke.phase === 2 ? 0.55 : 0.35;
+    const g = ctx.createLinearGradient(0, chamberCeil, 0, chamberCeil + gasH);
+    g.addColorStop(0, rgba(col, baseAlpha + 0.15));
+    g.addColorStop(1, rgba(col, baseAlpha));
+    ctx.fillStyle = g;
+    ctx.fillRect(boreL, chamberCeil, BORE, gasH);
+
+    // During compression, add pressure gradient at top
+    if (stroke.phase === 1) {
+      const density = stroke.progress;
+      const pg = ctx.createLinearGradient(0, chamberCeil, 0, chamberCeil + gasH * 0.5);
+      pg.addColorStop(0, rgba(COL_BLUE, density * 0.35));
+      pg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = pg;
+      ctx.fillRect(boreL, chamberCeil, BORE, gasH);
+    }
+
+    // During power, combustion glow
+    if (stroke.phase === 2) {
+      const intensity = Math.max(0, 1 - stroke.progress * 2.5);
+      if (intensity > 0) {
+        const cg = ctx.createRadialGradient(cx, chamberCeil + 8, 0, cx, chamberCeil + gasH * 0.3, gasH * 0.9);
+        cg.addColorStop(0, `rgba(255, 240, 120, ${intensity * 0.7})`);
+        cg.addColorStop(0.3, `rgba(255, 160, 40, ${intensity * 0.5})`);
+        cg.addColorStop(1, `rgba(255, 80, 0, 0)`);
+        ctx.fillStyle = cg;
+        ctx.fillRect(boreL, chamberCeil, BORE, gasH);
+      }
+    }
+
+    ctx.restore();
+  }
+
+  function drawPiston(cx, pinY) {
+    const boreL = cx - BORE / 2;
+    const pTop = pinY - PH * 0.7;
+    const pBot = pinY + PH * 0.3;
+    const clearance = 3;
+    const pW = BORE - clearance * 2;
+    const pL = boreL + clearance;
+
+    // Piston body
+    const pg = metalGradH(pL, pW);
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.roundRect(pL, pTop, pW, PH, [3, 3, 1, 1]);
+    ctx.fill();
+
+    // Piston crown (top surface - slightly different shade)
+    const crownGrad = ctx.createLinearGradient(0, pTop, 0, pTop + 6);
+    crownGrad.addColorStop(0, '#8a8a92');
+    crownGrad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = crownGrad;
+    ctx.fillRect(pL + 2, pTop, pW - 4, 6);
+
+    // Ring grooves (3 rings near top)
+    ctx.strokeStyle = '#222228';
+    ctx.lineWidth = 2.5;
+    for (let i = 0; i < 3; i++) {
+      const ry = pTop + 7 + i * 6;
+      ctx.beginPath();
+      ctx.moveTo(pL, ry);
+      ctx.lineTo(pL + pW, ry);
+      ctx.stroke();
+    }
+
+    // Ring highlights
+    ctx.strokeStyle = 'rgba(200,200,210,0.25)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 3; i++) {
+      const ry = pTop + 5.5 + i * 6;
+      ctx.beginPath();
+      ctx.moveTo(pL + 2, ry);
+      ctx.lineTo(pL + pW - 2, ry);
+      ctx.stroke();
+    }
+
+    // Wrist pin
+    ctx.beginPath();
+    ctx.arc(cx, pinY, 6, 0, Math.PI * 2);
+    const wpGrad = ctx.createRadialGradient(cx - 1, pinY - 1, 1, cx, pinY, 6);
+    wpGrad.addColorStop(0, '#d0d0d8');
+    wpGrad.addColorStop(1, '#5a5a62');
+    ctx.fillStyle = wpGrad;
+    ctx.fill();
+
+    // Piston edges
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(pL, pTop, pW, PH, [3, 3, 1, 1]);
+    ctx.stroke();
+  }
+
+  function drawCylinderHead(cx, chamberCeil) {
+    const headBottom = chamberCeil;
+    const headTop = chamberCeil - HH;
+    const halfBore = BORE / 2;
+    const headL = cx - halfBore - WT - 6;
+    const headR = cx + halfBore + WT + 6;
+    const headW = headR - headL;
+
+    // Head block
+    const hg = ctx.createLinearGradient(0, headTop, 0, headBottom);
+    hg.addColorStop(0,   '#4e4e56');
+    hg.addColorStop(0.3, '#62626a');
+    hg.addColorStop(0.7, '#56565e');
+    hg.addColorStop(1,   '#3e3e46');
+    ctx.fillStyle = hg;
+    ctx.beginPath();
+    ctx.roundRect(headL, headTop, headW, HH, [6, 6, 0, 0]);
+    ctx.fill();
+
+    // Head gasket line
+    ctx.strokeStyle = '#ff634780';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(headL + 4, headBottom - 1);
+    ctx.lineTo(headR - 4, headBottom - 1);
+    ctx.stroke();
+
+    // Head top edge highlight
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(headL + 6, headTop);
+    ctx.lineTo(headR - 6, headTop);
+    ctx.stroke();
+
+    // Head studs (small circles on sides)
+    const studs = [headTop + 12, headTop + 28];
+    for (const sy of studs) {
+      for (const sx of [headL + 5, headR - 5]) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#3a3a42';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawValves(cx, chamberCeil, stroke) {
+    const intakeX = cx - BORE * 0.28;
+    const exhaustX = cx + BORE * 0.28;
+    const headTop = chamberCeil - HH;
+    const valveHeadW = 18;
+    const stemW = 4;
+
+    // Intake valve lift
+    let intakeLift = 0;
+    if (stroke.phase === 0) intakeLift = getValveLift(stroke.progress);
+
+    // Exhaust valve lift
+    let exhaustLift = 0;
+    if (stroke.phase === 3) exhaustLift = getValveLift(stroke.progress);
+
+    // Draw valve helper
+    function drawValve(vx, lift, label, isIntake) {
+      const seatY = chamberCeil;
+      const headY = seatY + lift;
+
+      // Valve stem
+      ctx.fillStyle = '#7a7a82';
+      ctx.fillRect(vx - stemW / 2, headTop + 4, stemW, headY - headTop - 4);
+
+      // Valve head (tulip shape)
+      ctx.beginPath();
+      ctx.moveTo(vx - valveHeadW / 2, headY + 3);
+      ctx.lineTo(vx - stemW / 2 - 1, headY - 1);
+      ctx.lineTo(vx + stemW / 2 + 1, headY - 1);
+      ctx.lineTo(vx + valveHeadW / 2, headY + 3);
+      ctx.lineTo(vx + valveHeadW / 2, headY + 6);
+      ctx.lineTo(vx - valveHeadW / 2, headY + 6);
+      ctx.closePath();
+      const vGrad = ctx.createLinearGradient(vx - valveHeadW/2, 0, vx + valveHeadW/2, 0);
+      vGrad.addColorStop(0,   '#5a5a62');
+      vGrad.addColorStop(0.4, '#9a9aa2');
+      vGrad.addColorStop(1,   '#4a4a52');
+      ctx.fillStyle = vGrad;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+
+      // Valve seat ring
+      if (lift < 2) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(vx - valveHeadW / 2 - 2, seatY);
+        ctx.lineTo(vx + valveHeadW / 2 + 2, seatY);
+        ctx.stroke();
+      }
+
+      // Spring (zigzag above head)
+      const springTop = headTop + 6;
+      const springBot = headY - 4;
+      const springCoils = 5;
+      const springW = 8;
+      if (springBot > springTop + 6) {
+        ctx.strokeStyle = 'rgba(160, 200, 160, 0.45)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(vx, springTop);
+        const coilH = (springBot - springTop) / springCoils;
+        for (let i = 0; i < springCoils; i++) {
+          const cy = springTop + i * coilH;
+          ctx.lineTo(vx + (i % 2 === 0 ? springW : -springW), cy + coilH / 2);
+          ctx.lineTo(vx, cy + coilH);
+        }
+        ctx.stroke();
+      }
+
+      // Label
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.font = '500 9px Inter';
+      ctx.textAlign = 'center';
+      ctx.fillText(label, vx, headTop - 4);
+    }
+
+    drawValve(intakeX, intakeLift, 'IN', true);
+    drawValve(exhaustX, exhaustLift, 'EX', false);
+  }
+
+  function drawPorts(cx, chamberCeil, stroke) {
+    const headTop = chamberCeil - HH;
+    const intakeX = cx - BORE * 0.28;
+    const exhaustX = cx + BORE * 0.28;
+    const headL = cx - BORE / 2 - WT - 6;
+    const headR = cx + BORE / 2 + WT + 6;
+
+    // Intake port (left channel)
+    const ipLen = 50;
+    ctx.save();
+    ctx.globalAlpha = stroke.phase === 0 ? 0.6 : 0.15;
+    ctx.strokeStyle = stroke.phase === 0 ? rgba(COL_BLUE, 0.8) : '#555';
+    ctx.lineWidth = 14;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(headL - ipLen, headTop + HH * 0.35);
+    ctx.quadraticCurveTo(headL, headTop + HH * 0.5, intakeX, chamberCeil - 3);
+    ctx.stroke();
+
+    // Port label
+    ctx.globalAlpha = 0.35;
+    ctx.font = '600 10px Inter';
+    ctx.fillStyle = '#aaa';
+    ctx.textAlign = 'right';
+    ctx.fillText('INTAKE', headL - ipLen - 4, headTop + HH * 0.35 + 4);
+
+    // Intake arrow
+    if (stroke.phase === 0) {
+      ctx.globalAlpha = 0.7;
+      const ax = headL - 20;
+      const ay = headTop + HH * 0.4;
+      ctx.fillStyle = rgba(COL_BLUE, 0.9);
+      ctx.beginPath();
+      ctx.moveTo(ax + 12, ay - 5);
+      ctx.lineTo(ax + 20, ay);
+      ctx.lineTo(ax + 12, ay + 5);
+      ctx.fill();
+    }
+
+    ctx.restore();
+
+    // Exhaust port (right channel)
+    ctx.save();
+    ctx.globalAlpha = stroke.phase === 3 ? 0.6 : 0.15;
+    ctx.strokeStyle = stroke.phase === 3 ? rgba(COL_GRAY, 0.8) : '#555';
+    ctx.lineWidth = 14;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(exhaustX, chamberCeil - 3);
+    ctx.quadraticCurveTo(headR, headTop + HH * 0.5, headR + ipLen, headTop + HH * 0.35);
+    ctx.stroke();
+
+    ctx.globalAlpha = 0.35;
+    ctx.font = '600 10px Inter';
+    ctx.textAlign = 'left';
+    ctx.fillText('EXHAUST', headR + ipLen + 6, headTop + HH * 0.35 + 4);
+
+    // Exhaust arrow
+    if (stroke.phase === 3) {
+      ctx.globalAlpha = 0.7;
+      const ax = headR + 22;
+      const ay = headTop + HH * 0.4;
+      ctx.fillStyle = rgba(COL_GRAY, 0.9);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay - 5);
+      ctx.lineTo(ax + 8, ay);
+      ctx.lineTo(ax, ay + 5);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  function drawSparkPlug(cx, chamberCeil, stroke) {
+    const headTop = chamberCeil - HH;
+    const plugTop = headTop - 14;
+    const plugBot = chamberCeil + 3;
+    const plugW = 9;
+
+    // Ceramic insulator (top part)
+    ctx.fillStyle = '#d4cfc0';
+    ctx.beginPath();
+    ctx.roundRect(cx - plugW/2, plugTop, plugW, 12, 3);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+    ctx.lineWidth = 0.5;
+    ctx.stroke();
+
+    // Hex nut
+    ctx.fillStyle = '#78787f';
+    ctx.fillRect(cx - 7, plugTop + 12, 14, 8);
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.stroke();
+
+    // Threaded body (goes through head)
+    ctx.fillStyle = '#5a5a62';
+    ctx.fillRect(cx - 3, plugTop + 20, 6, plugBot - plugTop - 20);
+
+    // Electrode tip
+    ctx.fillStyle = '#888';
+    ctx.fillRect(cx - 1.5, plugBot, 3, 5);
+
+    // Ground electrode
+    ctx.strokeStyle = '#777';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx - 1, plugBot + 4);
+    ctx.lineTo(cx - 5, plugBot + 4);
+    ctx.lineTo(cx - 5, plugBot + 1);
+    ctx.stroke();
+
+    // Spark flash at ignition
+    if (stroke.phase === 2 && stroke.progress < 0.12) {
+      sparkTimer = 1 - stroke.progress / 0.12;
+    } else {
+      sparkTimer *= 0.9;
+    }
+
+    if (sparkTimer > 0.05) {
+      ctx.save();
+      const sparkY = plugBot + 3;
+      ctx.shadowBlur = 25 * sparkTimer;
+      ctx.shadowColor = '#fff8a0';
+
+      // Electric arc
+      ctx.strokeStyle = `rgba(255, 255, 180, ${sparkTimer})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 1, sparkY);
+      ctx.lineTo(cx - 4 + Math.random() * 2, sparkY - 1 + Math.random() * 2);
+      ctx.stroke();
+
+      // Glow orb
+      const sg = ctx.createRadialGradient(cx - 2, sparkY, 0, cx - 2, sparkY, 14 * sparkTimer);
+      sg.addColorStop(0, `rgba(255, 255, 240, ${sparkTimer * 0.9})`);
+      sg.addColorStop(0.4, `rgba(255, 220, 80, ${sparkTimer * 0.6})`);
+      sg.addColorStop(1, 'rgba(255, 140, 0, 0)');
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.arc(cx - 2, sparkY, 14 * sparkTimer, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+  }
+
+  function spawnGasParticles(cx, chamberCeil, pistonTop, stroke) {
+    const intakeX = cx - BORE * 0.28;
+    const exhaustX = cx + BORE * 0.28;
+    const boreL = cx - BORE / 2;
+
+    if (stroke.phase === 0 && Math.random() < 0.5) {
+      // Intake: blue particles flow down from intake valve
+      spawnParticle(
+        intakeX + (Math.random() - 0.5) * 20,
+        chamberCeil + 8,
+        (Math.random() - 0.5) * 1.5,
+        1.5 + Math.random() * 2,
+        `hsl(210, 80%, ${55 + Math.random()*20}%)`,
+        40 + Math.random() * 30,
+        2 + Math.random() * 3
+      );
+    }
+
+    if (stroke.phase === 2 && stroke.progress < 0.2 && Math.random() < 0.8) {
+      // Combustion: orange particles explode outward
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1.5 + Math.random() * 3;
+      spawnParticle(
+        cx + (Math.random()-0.5) * 20,
+        chamberCeil + 10 + Math.random() * 20,
+        Math.cos(angle) * speed,
+        Math.sin(angle) * speed * 0.7 + 1,
+        `hsl(${30 + Math.random()*20}, 100%, ${55 + Math.random()*25}%)`,
+        25 + Math.random() * 25,
+        2 + Math.random() * 4
+      );
+    }
+
+    if (stroke.phase === 3 && Math.random() < 0.4) {
+      // Exhaust: gray particles flow up toward exhaust valve
+      spawnParticle(
+        exhaustX + (Math.random() - 0.5) * 20,
+        pistonTop + 5 + Math.random() * (chamberCeil + 20 - pistonTop),
+        (Math.random() - 0.5) * 1,
+        -1.5 - Math.random() * 2,
+        `hsl(0, 0%, ${50 + Math.random()*20}%)`,
+        35 + Math.random() * 25,
+        2 + Math.random() * 2.5
+      );
+    }
+  }
+
+  function drawCombustionFlash(cx, chamberCeil, pistonTop, stroke) {
+    if (stroke.phase !== 2) return;
+    const intensity = Math.max(0, 1 - stroke.progress * 5);
+    if (intensity <= 0) return;
+
+    const gasH = pistonTop - chamberCeil;
+    const boreL = cx - BORE / 2;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(boreL + 1, chamberCeil, BORE - 2, gasH);
+    ctx.clip();
+
+    ctx.shadowBlur = 40 * intensity;
+    ctx.shadowColor = '#ffa020';
+
+    const fg = ctx.createRadialGradient(cx, chamberCeil + 12, 0, cx, chamberCeil + gasH * 0.3, BORE * 0.8);
+    fg.addColorStop(0, `rgba(255, 255, 220, ${intensity * 0.85})`);
+    fg.addColorStop(0.2, `rgba(255, 200, 60, ${intensity * 0.6})`);
+    fg.addColorStop(0.5, `rgba(255, 120, 20, ${intensity * 0.3})`);
+    fg.addColorStop(1, 'rgba(255, 80, 0, 0)');
+    ctx.fillStyle = fg;
+    ctx.fillRect(boreL, chamberCeil, BORE, gasH);
+
+    ctx.restore();
+  }
+
+  /* ═══════════════════════════════════════
+     HUD / DASHBOARD
+     ═══════════════════════════════════════ */
+  function drawHUD(stroke) {
+    const hudX = W * 0.72;
+    const hudStartY = H * 0.12;
+
+    // Title
+    ctx.textAlign = 'center';
+    ctx.font = '800 22px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText('4-STROKE PISTON ENGINE', W * 0.42, 36);
+    ctx.font = '400 12px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fillText('CROSS-SECTION  ANIMATION', W * 0.42, 54);
+
+    // Current stroke section
+    const strokeColors = {
+      'INTAKE': '#1e90ff',
+      'COMPRESSION': '#4169e1',
+      'POWER': '#ff8c00',
+      'EXHAUST': '#888888'
+    };
+    const scol = strokeColors[stroke.name];
+
+    // Stroke name
+    ctx.textAlign = 'left';
+    ctx.font = '800 36px Inter';
+    ctx.fillStyle = scol;
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = scol + '60';
+    ctx.fillText(stroke.name, hudX - 60, hudStartY + 40);
+    ctx.shadowBlur = 0;
+
+    // Stroke subtitle
+    ctx.font = '400 14px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    ctx.fillText(stroke.desc, hudX - 60, hudStartY + 62);
+
+    // Divider
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(hudX - 60, hudStartY + 78);
+    ctx.lineTo(hudX + 170, hudStartY + 78);
+    ctx.stroke();
+
+    // Progress bar
+    const barX = hudX - 60;
+    const barY = hudStartY + 92;
+    const barW = 230;
+    const barH = 6;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW, barH, 3);
+    ctx.fill();
+
+    ctx.fillStyle = scol;
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW * stroke.progress, barH, 3);
+    ctx.fill();
+
+    // Crank angle display
+    const degIn720 = Math.round(getCycleAngle() * 180 / Math.PI);
+    ctx.font = '600 13px "JetBrains Mono"';
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillText(`CRANK ANGLE`, barX, barY + 28);
+    ctx.font = '700 20px "JetBrains Mono"';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText(`${degIn720}°`, barX + 120, barY + 28);
+    ctx.font = '400 11px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fillText(`/ 720°`, barX + 165, barY + 28);
+
+    // Cycle indicator circle
+    drawCycleIndicator(hudX + 55, hudStartY + 220, 55, stroke);
+
+    // Valve states
+    const vsY = hudStartY + 308;
+    ctx.font = '600 12px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.textAlign = 'left';
+    ctx.fillText('VALVE STATUS', barX, vsY);
+
+    // Intake valve state
+    const ivOpen = stroke.phase === 0;
+    ctx.beginPath();
+    ctx.arc(barX + 10, vsY + 22, 5, 0, Math.PI * 2);
+    ctx.fillStyle = ivOpen ? '#4aff6a' : '#ff4a4a80';
+    ctx.fill();
+    ctx.font = '500 12px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText(`Intake: ${ivOpen ? 'OPEN' : 'CLOSED'}`, barX + 22, vsY + 26);
+
+    // Exhaust valve state
+    const evOpen = stroke.phase === 3;
+    ctx.beginPath();
+    ctx.arc(barX + 130, vsY + 22, 5, 0, Math.PI * 2);
+    ctx.fillStyle = evOpen ? '#4aff6a' : '#ff4a4a80';
+    ctx.fill();
+    ctx.fillText(`Exhaust: ${evOpen ? 'OPEN' : 'CLOSED'}`, barX + 142, vsY + 26);
+
+    // Stroke descriptions
+    drawStrokeDescriptions(barX, vsY + 56, stroke);
+  }
+
+  function drawCycleIndicator(cx, cy, r, stroke) {
+    const segments = [
+      { name: 'INT', color: '#1e90ff', start: -Math.PI/2, end: 0 },
+      { name: 'CMP', color: '#4169e1', start: 0, end: Math.PI/2 },
+      { name: 'POW', color: '#ff8c00', start: Math.PI/2, end: Math.PI },
+      { name: 'EXH', color: '#888888', start: Math.PI, end: 3*Math.PI/2 },
+    ];
+
+    // Draw segments
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const isActive = stroke.phase === i;
+
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, r, seg.start, seg.end);
+      ctx.closePath();
+      ctx.fillStyle = isActive ? seg.color + 'aa' : seg.color + '25';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // Segment label
+      const midAngle = (seg.start + seg.end) / 2;
+      const lx = cx + Math.cos(midAngle) * r * 0.58;
+      const ly = cy + Math.sin(midAngle) * r * 0.58;
+      ctx.font = `${isActive ? '700' : '500'} 9px Inter`;
+      ctx.fillStyle = isActive ? '#fff' : 'rgba(255,255,255,0.4)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(seg.name, lx, ly);
+    }
+
+    // Needle
+    const needleAngle = -Math.PI/2 + (getCycleAngle() / (4 * Math.PI)) * 2 * Math.PI;
+    const nx = cx + Math.cos(needleAngle) * (r - 4);
+    const ny = cy + Math.sin(needleAngle) * (r - 4);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(nx, ny);
+    ctx.stroke();
+
+    // Center dot
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  function drawStrokeDescriptions(x, y, currentStroke) {
+    const strokes = [
+      { name: '1. Intake',      short: 'Piston ↓ · Intake valve open',     color: '#1e90ff', phase: 0 },
+      { name: '2. Compression', short: 'Piston ↑ · Both valves closed',    color: '#4169e1', phase: 1 },
+      { name: '3. Power',       short: 'Piston ↓ · Spark ignites mixture', color: '#ff8c00', phase: 2 },
+      { name: '4. Exhaust',     short: 'Piston ↑ · Exhaust valve open',    color: '#888',    phase: 3 },
+    ];
+
+    for (let i = 0; i < strokes.length; i++) {
+      const s = strokes[i];
+      const isActive = currentStroke.phase === s.phase;
+      const sy = y + i * 30;
+
+      // Active indicator
+      if (isActive) {
+        ctx.fillStyle = s.color + '18';
+        ctx.beginPath();
+        ctx.roundRect(x - 6, sy - 12, 240, 26, 4);
+        ctx.fill();
+
+        ctx.fillStyle = s.color;
+        ctx.fillRect(x - 6, sy - 12, 3, 26);
+      }
+
+      ctx.font = `${isActive ? '700' : '500'} 11px Inter`;
+      ctx.fillStyle = isActive ? s.color : 'rgba(255,255,255,0.3)';
+      ctx.textAlign = 'left';
+      ctx.fillText(s.name, x + 4, sy);
+
+      ctx.font = '400 10px Inter';
+      ctx.fillStyle = isActive ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.18)';
+      ctx.fillText(s.short, x + 4, sy + 12);
+    }
+  }
+
+  /* ═══════════════════════════════════════
+     MAIN LOOP
+     ═══════════════════════════════════════ */
+  function animate() {
+    resize(); // handle dynamic resize
+
+    const cx = W * 0.36;
+    const cy = W < 900 ? H * 0.58 : H * 0.56;
+
+    const pinY = getPistonPinY(cy);
+    const cp = getCrankPin(cx, cy);
+    const pistonTop = pinY - PH * 0.7;
+    const chamberCeil = cy - (R + L) - PH * 0.7 - CLR;
+    const stroke = getStroke();
+
+    // Update
+    crankAngle += SPEED;
+    updateParticles();
+    spawnGasParticles(cx, chamberCeil, pistonTop, stroke);
+
+    // Draw
+    drawBackground();
+    drawCrankcase(cx, cy, chamberCeil);
+    drawCrankshaft(cx, cy, cp);
+    drawConnectingRod(cx, pinY, cp);
+    drawCylinderWalls(cx, cy, chamberCeil);
+    drawGas(cx, chamberCeil, pistonTop, stroke);
+    drawCombustionFlash(cx, chamberCeil, pistonTop, stroke);
+    drawPiston(cx, pinY);
+    drawCylinderHead(cx, chamberCeil);
+    drawPorts(cx, chamberCeil, stroke);
+    drawValves(cx, chamberCeil, stroke);
+    drawSparkPlug(cx, chamberCeil, stroke);
+    drawParticles();
+    drawHUD(stroke);
+
+    // Footer
+    ctx.textAlign = 'center';
+    ctx.font = '400 11px Inter';
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillText('4-Stroke Otto Cycle · Seamless Loop Animation', W / 2, H - 18);
+
+    requestAnimationFrame(animate);
+  }
+
+  animate();
+})();
+</script>
+</body>
+</html>
