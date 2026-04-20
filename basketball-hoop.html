@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Basketball Swish – Hoop Animation</title>
+    <meta name="description"
+        content="A realistic basketball falling through a hoop with stretching net physics, rim vibration, and smooth looping animation.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        *,
+        *::before,
+        *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: #0c0e17;
+            background-image:
+                radial-gradient(ellipse at 50% 20%, rgba(40, 25, 15, 0.5) 0%, transparent 55%),
+                radial-gradient(ellipse at 50% 100%, rgba(8, 8, 14, 1) 0%, transparent 60%);
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                radial-gradient(1px 1px at 10% 20%, rgba(255, 255, 255, 0.06), transparent),
+                radial-gradient(1px 1px at 30% 55%, rgba(255, 255, 255, 0.04), transparent),
+                radial-gradient(1px 1px at 50% 10%, rgba(255, 255, 255, 0.05), transparent),
+                radial-gradient(1px 1px at 70% 70%, rgba(255, 255, 255, 0.03), transparent),
+                radial-gradient(1px 1px at 90% 30%, rgba(255, 255, 255, 0.04), transparent);
+            pointer-events: none;
+        }
+
+        canvas {
+            display: block;
+            z-index: 1;
+            position: relative;
+        }
+
+        .label {
+            position: relative;
+            z-index: 1;
+            margin-top: 30px;
+            text-align: center;
+        }
+
+        .label h1 {
+            font-size: 15px;
+            font-weight: 300;
+            letter-spacing: 9px;
+            text-transform: uppercase;
+            color: rgba(220, 160, 90, 0.3);
+        }
+
+        .label p {
+            font-size: 11px;
+            font-weight: 300;
+            letter-spacing: 4px;
+            color: rgba(150, 120, 80, 0.2);
+            margin-top: 6px;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="hoopCanvas" width="600" height="700"></canvas>
+    <div class="label">
+        <h1>Nothing but net</h1>
+        <p>swish</p>
+    </div>
+
+    <script>
+        (function () {
+            const canvas = document.getElementById('hoopCanvas');
+            const ctx = canvas.getContext('2d');
+            const W = canvas.width;
+            const H = canvas.height;
+
+            // ── Configuration ─────────────────────────────────────
+            const RIM_Y = 280;
+            const RIM_X = W / 2;
+            const RIM_RADIUS = 55;
+            const RIM_THICKNESS = 6;
+            const BALL_RADIUS = 30;
+            const GRAVITY = 0.38;
+            const NET_RINGS = 8;
+            const NET_SEGMENTS = 12;
+            const NET_LENGTH = 120;
+
+            // ── Animation state ───────────────────────────────────
+            const LOOP_DURATION = 180; // frames per loop
+            let frame = 0;
+
+            // ── Ball state ────────────────────────────────────────
+            let ball = { x: 0, y: 0, vy: 0, vx: 0, visible: true, rotation: 0 };
+
+            // ── Rim vibration ─────────────────────────────────────
+            let rimVib = { amplitude: 0, phase: 0, decay: 0.88, freq: 0.7 };
+
+            // ── Net particles ─────────────────────────────────────
+            // Net is a grid: rings (rows) x segments (columns)
+            // Top ring is pinned to the rim
+            let netNodes = [];
+            let netRestPositions = [];
+
+            function initNet() {
+                netNodes = [];
+                netRestPositions = [];
+                for (let ring = 0; ring <= NET_RINGS; ring++) {
+                    const row = [];
+                    const restRow = [];
+                    const t = ring / NET_RINGS;
+                    const ringY = RIM_Y + t * NET_LENGTH;
+                    const ringRadius = RIM_RADIUS - t * 22; // taper inward
+                    for (let seg = 0; seg < NET_SEGMENTS; seg++) {
+                        const angle = (seg / NET_SEGMENTS) * Math.PI * 2;
+                        const x = RIM_X + Math.cos(angle) * ringRadius;
+                        const y = ringY;
+                        row.push({ x, y, vx: 0, vy: 0, pinned: ring === 0 });
+                        restRow.push({ x, y });
+                    }
+                    netNodes.push(row);
+                    netRestPositions.push(restRow);
+                }
+            }
+
+            function resetNet() {
+                for (let ring = 0; ring <= NET_RINGS; ring++) {
+                    for (let seg = 0; seg < NET_SEGMENTS; seg++) {
+                        const rest = netRestPositions[ring][seg];
+                        const node = netNodes[ring][seg];
+                        node.x = rest.x;
+                        node.y = rest.y;
+                        node.vx = 0;
+                        node.vy = 0;
+                    }
+                }
+            }
+
+            initNet();
+
+            // ── Ball trajectory phases ────────────────────────────
+            function resetBall() {
+                // Ball starts above and slightly left, arcs in
+                ball.x = RIM_X;
+                ball.y = -50;
+                ball.vy = 3.5;
+                ball.vx = 0;
+                ball.visible = true;
+                ball.rotation = 0;
+                rimVib.amplitude = 0;
+            }
+
+            resetBall();
+
+            // ── Net physics ───────────────────────────────────────
+            function updateNet() {
+                const stiffness = 0.06;
+                const damping = 0.92;
+                const netGravity = 0.12;
+
+                for (let ring = 0; ring <= NET_RINGS; ring++) {
+                    for (let seg = 0; seg < NET_SEGMENTS; seg++) {
+                        const node = netNodes[ring][seg];
+                        if (node.pinned) {
+                            // Pinned nodes follow rim vibration
+                            const restPos = netRestPositions[ring][seg];
+                            const vibOffset = Math.sin(rimVib.phase + seg * 0.5) * rimVib.amplitude;
+                            node.x = restPos.x + vibOffset * 0.3;
+                            node.y = restPos.y + Math.abs(vibOffset) * 0.15;
+                            continue;
+                        }
+
+                        // Spring force toward rest position
+                        const rest = netRestPositions[ring][seg];
+                        const dx = rest.x - node.x;
+                        const dy = rest.y - node.y;
+                        node.vx += dx * stiffness;
+                        node.vy += dy * stiffness;
+
+                        // Connection springs to neighbors
+                        // Vertical (ring above)
+                        if (ring > 0) {
+                            const above = netNodes[ring - 1][seg];
+                            const aboveDx = above.x - node.x;
+                            const aboveDy = above.y - node.y;
+                            const dist = Math.sqrt(aboveDx * aboveDx + aboveDy * aboveDy);
+                            const restDist = NET_LENGTH / NET_RINGS;
+                            const force = (dist - restDist) * 0.03;
+                            if (dist > 0) {
+                                node.vx += (aboveDx / dist) * force;
+                                node.vy += (aboveDy / dist) * force;
+                            }
+                        }
+
+                        // Horizontal (adjacent segments)
+                        const left = netNodes[ring][(seg - 1 + NET_SEGMENTS) % NET_SEGMENTS];
+                        const right = netNodes[ring][(seg + 1) % NET_SEGMENTS];
+                        [left, right].forEach(neighbor => {
+                            const ndx = neighbor.x - node.x;
+                            const ndy = neighbor.y - node.y;
+                            const ndist = Math.sqrt(ndx * ndx + ndy * ndy);
+                            const nRestDist = 2 * Math.PI * (RIM_RADIUS - (ring / NET_RINGS) * 22) / NET_SEGMENTS;
+                            const nForce = (ndist - nRestDist) * 0.015;
+                            if (ndist > 0) {
+                                node.vx += (ndx / ndist) * nForce;
+                                node.vy += (ndy / ndist) * nForce;
+                            }
+                        });
+
+                        node.vy += netGravity;
+                        node.vx *= damping;
+                        node.vy *= damping;
+                        node.x += node.vx;
+                        node.y += node.vy;
+                    }
+                }
+            }
+
+            // ── Ball-net collision ─────────────────────────────────
+            function ballNetCollision() {
+                if (!ball.visible) return;
+
+                const pushForce = 4.5;
+                const ballR = BALL_RADIUS + 5;
+
+                for (let ring = 1; ring <= NET_RINGS; ring++) {
+                    for (let seg = 0; seg < NET_SEGMENTS; seg++) {
+                        const node = netNodes[ring][seg];
+                        const dx = node.x - ball.x;
+                        const dy = node.y - ball.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+
+                        if (dist < ballR && dist > 0) {
+                            const overlap = ballR - dist;
+                            const nx = dx / dist;
+                            const ny = dy / dist;
+                            node.vx += nx * overlap * 0.3 + (ball.vx || 0) * 0.1;
+                            node.vy += ny * overlap * 0.3 + ball.vy * 0.15;
+                            node.x += nx * overlap * 0.5;
+                            node.y += ny * overlap * 0.5;
+                        }
+                    }
+                }
+            }
+
+            // ── Update ball ───────────────────────────────────────
+            function updateBall() {
+                if (!ball.visible) return;
+
+                ball.vy += GRAVITY;
+                ball.x += ball.vx;
+                ball.y += ball.vy;
+                ball.rotation += ball.vx * 0.02 + 0.03;
+
+                // Rim collision (ball grazes the rim edge)
+                const distToRimCenter = ball.x - RIM_X;
+                const ballBottom = ball.y + BALL_RADIUS;
+
+                // Check if ball hits rim edges
+                const leftRimX = RIM_X - RIM_RADIUS;
+                const rightRimX = RIM_X + RIM_RADIUS;
+
+                // Left rim edge collision
+                const dxL = ball.x - leftRimX;
+                const dyL = ball.y - RIM_Y;
+                const distL = Math.sqrt(dxL * dxL + dyL * dyL);
+                if (distL < BALL_RADIUS + RIM_THICKNESS / 2 && ball.vy > 0 && ball.y < RIM_Y + 15) {
+                    rimVib.amplitude = Math.min(ball.vy * 1.2, 8);
+                    rimVib.phase = 0;
+                    ball.vy *= 0.7;
+                    ball.vx += 1.2;
+                    ball.y = RIM_Y - BALL_RADIUS + 5;
+                }
+
+                // Right rim edge collision
+                const dxR = ball.x - rightRimX;
+                const dyR = ball.y - RIM_Y;
+                const distR = Math.sqrt(dxR * dxR + dyR * dyR);
+                if (distR < BALL_RADIUS + RIM_THICKNESS / 2 && ball.vy > 0 && ball.y < RIM_Y + 15) {
+                    rimVib.amplitude = Math.min(ball.vy * 1.2, 8);
+                    rimVib.phase = 0;
+                    ball.vy *= 0.7;
+                    ball.vx -= 1.2;
+                    ball.y = RIM_Y - BALL_RADIUS + 5;
+                }
+
+                // Ball off screen
+                if (ball.y > H + 80) {
+                    ball.visible = false;
+                }
+            }
+
+            // ── Update rim vibration ──────────────────────────────
+            function updateRimVib() {
+                if (rimVib.amplitude > 0.05) {
+                    rimVib.phase += rimVib.freq;
+                    rimVib.amplitude *= rimVib.decay;
+                } else {
+                    rimVib.amplitude = 0;
+                }
+            }
+
+            // ── Drawing functions ─────────────────────────────────
+
+            // Backboard
+            function drawBackboard() {
+                const bx = RIM_X + RIM_RADIUS + 8;
+                const by = RIM_Y - 100;
+                const bw = 12;
+                const bh = 130;
+
+                // Board shadow
+                ctx.save();
+                ctx.shadowColor = 'rgba(0, 0, 0, 0.4)';
+                ctx.shadowBlur = 20;
+                ctx.shadowOffsetX = 5;
+
+                // Board
+                const boardGrad = ctx.createLinearGradient(bx, by, bx + bw, by);
+                boardGrad.addColorStop(0, '#2a2a38');
+                boardGrad.addColorStop(0.5, '#383848');
+                boardGrad.addColorStop(1, '#22222e');
+
+                ctx.beginPath();
+                ctx.roundRect(bx, by, bw, bh, 3);
+                ctx.fillStyle = boardGrad;
+                ctx.fill();
+                ctx.restore();
+
+                // Board highlight
+                ctx.beginPath();
+                ctx.moveTo(bx + 2, by + 5);
+                ctx.lineTo(bx + 2, by + bh - 5);
+                ctx.strokeStyle = 'rgba(200, 200, 220, 0.08)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                // Mounting bracket
+                ctx.beginPath();
+                ctx.roundRect(bx - 3, RIM_Y - 8, bw + 6, 16, 2);
+                ctx.fillStyle = '#1e1e28';
+                ctx.fill();
+            }
+
+            // Rim
+            function drawRim(behind) {
+                const vibX = Math.sin(rimVib.phase) * rimVib.amplitude;
+                const vibY = Math.cos(rimVib.phase * 1.3) * rimVib.amplitude * 0.3;
+                const leftX = RIM_X - RIM_RADIUS + vibX;
+                const rightX = RIM_X + RIM_RADIUS + vibX;
+                const y = RIM_Y + vibY;
+
+                if (behind) {
+                    // Back part of rim (behind ball)
+                    // Rim connector to backboard
+                    ctx.beginPath();
+                    ctx.moveTo(rightX, y);
+                    ctx.lineTo(RIM_X + RIM_RADIUS + 10, y);
+                    ctx.strokeStyle = '#cc4400';
+                    ctx.lineWidth = RIM_THICKNESS;
+                    ctx.lineCap = 'round';
+                    ctx.stroke();
+
+                    // Back rim arc (the far side)
+                    ctx.beginPath();
+                    ctx.ellipse(RIM_X + vibX, y, RIM_RADIUS, 8, 0, Math.PI, 0);
+                    ctx.strokeStyle = '#aa3300';
+                    ctx.lineWidth = RIM_THICKNESS;
+                    ctx.lineCap = 'round';
+                    ctx.stroke();
+
+                    // Rim metallic shine (back)
+                    ctx.beginPath();
+                    ctx.ellipse(RIM_X + vibX, y - 2, RIM_RADIUS - 2, 6, 0, Math.PI + 0.1, -0.1);
+                    ctx.strokeStyle = 'rgba(255, 150, 50, 0.15)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                } else {
+                    // Front rim arc
+                    ctx.beginPath();
+                    ctx.ellipse(RIM_X + vibX, y, RIM_RADIUS, 8, 0, 0, Math.PI);
+                    ctx.strokeStyle = '#dd4400';
+                    ctx.lineWidth = RIM_THICKNESS;
+                    ctx.lineCap = 'round';
+                    ctx.stroke();
+
+                    // Front rim highlight
+                    ctx.beginPath();
+                    ctx.ellipse(RIM_X + vibX, y + 1, RIM_RADIUS - 2, 6, 0, 0.1, Math.PI - 0.1);
+                    ctx.strokeStyle = 'rgba(255, 180, 80, 0.25)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+
+                    // Rim glow
+                    ctx.save();
+                    ctx.shadowColor = 'rgba(255, 100, 20, 0.15)';
+                    ctx.shadowBlur = 12;
+                    ctx.beginPath();
+                    ctx.ellipse(RIM_X + vibX, y, RIM_RADIUS, 8, 0, 0, Math.PI);
+                    ctx.strokeStyle = 'rgba(255, 100, 20, 0.06)';
+                    ctx.lineWidth = 10;
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+
+            // Net
+            function drawNet() {
+                ctx.lineWidth = 1.5;
+                ctx.lineCap = 'round';
+
+                // Vertical strings
+                for (let seg = 0; seg < NET_SEGMENTS; seg++) {
+                    ctx.beginPath();
+                    for (let ring = 0; ring <= NET_RINGS; ring++) {
+                        const node = netNodes[ring][seg];
+                        if (ring === 0) ctx.moveTo(node.x, node.y);
+                        else ctx.lineTo(node.x, node.y);
+                    }
+                    const depth = Math.cos((seg / NET_SEGMENTS) * Math.PI * 2);
+                    const alpha = 0.18 + depth * 0.06;
+                    ctx.strokeStyle = `rgba(240, 240, 250, ${alpha})`;
+                    ctx.lineWidth = 1.2 + depth * 0.3;
+                    ctx.stroke();
+                }
+
+                // Horizontal ring strings
+                for (let ring = 1; ring <= NET_RINGS; ring++) {
+                    ctx.beginPath();
+                    for (let seg = 0; seg <= NET_SEGMENTS; seg++) {
+                        const node = netNodes[ring][seg % NET_SEGMENTS];
+                        if (seg === 0) ctx.moveTo(node.x, node.y);
+                        else ctx.lineTo(node.x, node.y);
+                    }
+                    const t = ring / NET_RINGS;
+                    ctx.strokeStyle = `rgba(240, 240, 250, ${0.12 - t * 0.04})`;
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+
+                // Net knots (small dots at intersections)
+                for (let ring = 1; ring <= NET_RINGS; ring++) {
+                    for (let seg = 0; seg < NET_SEGMENTS; seg++) {
+                        const node = netNodes[ring][seg];
+                        const depth = Math.cos((seg / NET_SEGMENTS) * Math.PI * 2);
+                        if (depth > -0.2) {
+                            ctx.beginPath();
+                            ctx.arc(node.x, node.y, 1.2, 0, Math.PI * 2);
+                            ctx.fillStyle = `rgba(255, 255, 255, ${0.12 + depth * 0.05})`;
+                            ctx.fill();
+                        }
+                    }
+                }
+            }
+
+            // Basketball
+            function drawBall() {
+                if (!ball.visible) return;
+
+                const x = ball.x;
+                const y = ball.y;
+                const r = BALL_RADIUS;
+
+                ctx.save();
+                ctx.translate(x, y);
+                ctx.rotate(ball.rotation);
+
+                // Ball shadow on wall (projected behind)
+                ctx.save();
+                ctx.shadowColor = 'rgba(0,0,0,0.3)';
+                ctx.shadowBlur = 30;
+                ctx.shadowOffsetX = 10;
+                ctx.shadowOffsetY = 10;
+
+                // Main ball body
+                const ballGrad = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r);
+                ballGrad.addColorStop(0, '#f5923a');
+                ballGrad.addColorStop(0.3, '#e87420');
+                ballGrad.addColorStop(0.6, '#c85a10');
+                ballGrad.addColorStop(0.85, '#a04008');
+                ballGrad.addColorStop(1, '#7a2e05');
+
+                ctx.beginPath();
+                ctx.arc(0, 0, r, 0, Math.PI * 2);
+                ctx.fillStyle = ballGrad;
+                ctx.fill();
+                ctx.restore();
+
+                // Ball texture lines (seams)
+                ctx.strokeStyle = 'rgba(60, 25, 5, 0.4)';
+                ctx.lineWidth = 1.8;
+
+                // Horizontal seam
+                ctx.beginPath();
+                ctx.ellipse(0, 0, r * 0.98, r * 0.15, 0, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Vertical seam
+                ctx.beginPath();
+                ctx.ellipse(0, 0, r * 0.15, r * 0.98, 0, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Curved side seams
+                ctx.beginPath();
+                ctx.ellipse(-r * 0.35, 0, r * 0.2, r * 0.85, -0.15, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(60, 25, 5, 0.25)';
+                ctx.lineWidth = 1.2;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.ellipse(r * 0.35, 0, r * 0.2, r * 0.85, 0.15, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Specular highlight
+                ctx.beginPath();
+                ctx.ellipse(-r * 0.2, -r * 0.25, r * 0.3, r * 0.15, -0.5, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
+                ctx.fill();
+
+                // Small bright spot
+                ctx.beginPath();
+                ctx.arc(-r * 0.28, -r * 0.35, r * 0.08, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+                ctx.fill();
+
+                // Pebble texture dots
+                ctx.fillStyle = 'rgba(100, 50, 15, 0.08)';
+                for (let i = 0; i < 40; i++) {
+                    const angle = Math.PI * 2 * (i / 40) + i * 2.39;
+                    const dist = (r * 0.3) + (i % 5) * r * 0.12;
+                    const px = Math.cos(angle) * dist;
+                    const py = Math.sin(angle) * dist;
+                    if (px * px + py * py < r * r * 0.85) {
+                        ctx.beginPath();
+                        ctx.arc(px, py, 1, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+
+                ctx.restore();
+            }
+
+            // Ground shadow
+            function drawGroundShadow() {
+                if (!ball.visible) return;
+                const shadowY = H - 40;
+                const shadowScale = Math.max(0.2, 1 - (shadowY - ball.y) / 600);
+                const shadowAlpha = Math.max(0, 0.15 * shadowScale);
+
+                ctx.beginPath();
+                ctx.ellipse(ball.x, shadowY, BALL_RADIUS * 1.5 * shadowScale, 5 * shadowScale, 0, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(0, 0, 0, ${shadowAlpha})`;
+                ctx.fill();
+            }
+
+            // Score text flash
+            let scoreFlash = 0;
+            function drawScoreFlash() {
+                if (scoreFlash <= 0) return;
+                const alpha = Math.min(1, scoreFlash / 20) * 0.6;
+                ctx.save();
+                ctx.font = `600 ${28 + (1 - scoreFlash / 40) * 8}px Inter`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = `rgba(255, 180, 60, ${alpha})`;
+                ctx.shadowColor = `rgba(255, 140, 30, ${alpha * 0.5})`;
+                ctx.shadowBlur = 20;
+                ctx.fillText('SWISH', RIM_X, RIM_Y - 70 - (40 - scoreFlash));
+                ctx.restore();
+                scoreFlash -= 0.8;
+            }
+
+            // ── Main loop ─────────────────────────────────────────
+            let loopTimer = 0;
+            let scored = false;
+
+            function update() {
+                loopTimer++;
+
+                // Reset cycle
+                if (!ball.visible && loopTimer > 120) {
+                    resetBall();
+                    resetNet();
+                    loopTimer = 0;
+                    scored = false;
+                }
+
+                updateBall();
+                ballNetCollision();
+                updateNet();
+                updateRimVib();
+
+                // Detect scoring (ball passes through rim plane)
+                if (ball.visible && ball.y > RIM_Y + 10 && ball.y < RIM_Y + 30 &&
+                    Math.abs(ball.x - RIM_X) < RIM_RADIUS * 0.7 && !scored) {
+                    scored = true;
+                    scoreFlash = 40;
+                }
+            }
+
+            function render() {
+                ctx.clearRect(0, 0, W, H);
+
+                // Ambient court glow
+                const ambGrad = ctx.createRadialGradient(RIM_X, RIM_Y, 20, RIM_X, RIM_Y, 300);
+                ambGrad.addColorStop(0, 'rgba(255, 140, 40, 0.03)');
+                ambGrad.addColorStop(1, 'transparent');
+                ctx.fillStyle = ambGrad;
+                ctx.fillRect(0, 0, W, H);
+
+                drawBackboard();
+                drawRim(true);         // Back rim (behind ball)
+                drawNet();
+                drawGroundShadow();
+
+                // Ball renders between back net and front rim
+                drawBall();
+
+                drawRim(false);        // Front rim (in front of ball)
+                drawScoreFlash();
+            }
+
+            function animate() {
+                update();
+                render();
+                requestAnimationFrame(animate);
+            }
+
+            animate();
+        })();
+    </script>
+</body>
+
+</html>
